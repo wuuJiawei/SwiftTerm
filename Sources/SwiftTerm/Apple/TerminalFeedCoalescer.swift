@@ -8,6 +8,28 @@
 #if os(macOS) || os(iOS) || os(visionOS)
 import Foundation
 
+/// Describes how ``TerminalFeedCoalescer`` handles output when producers are
+/// faster than the UI can safely consume.
+public enum TerminalFeedBackpressurePolicy {
+    /// Keep the newest bytes and discard the oldest pending bytes.
+    ///
+    /// This is the best default for live log viewers because the newest output is
+    /// usually the most useful output when the UI is falling behind.
+    case keepNewest
+
+    /// Keep the oldest pending bytes and discard newly appended overflow bytes.
+    ///
+    /// This preserves terminal stream continuity better than ``keepNewest`` but
+    /// may make a live log view lag behind a noisy producer.
+    case keepOldest
+
+    /// Never discard pending bytes.
+    ///
+    /// Use this only when the producer is already bounded. A bursty or unbounded
+    /// stream can grow memory without limit.
+    case unbounded
+}
+
 /// Batches high-frequency terminal output before feeding it into a ``TerminalView``.
 ///
 /// SwiftTerm's normal ``TerminalView/feed(byteArray:)`` and ``TerminalView/feed(text:)``
@@ -23,18 +45,42 @@ import Foundation
 public final class TerminalFeedCoalescer {
     private weak var terminalView: TerminalView?
     private let lock = NSLock()
-    private var pendingBytes: [UInt8] = []
+    private var pendingData = Data()
     private var timer: Timer?
     private let runLoopMode: RunLoop.Mode
+    private var droppedBytesStorage: UInt64 = 0
 
     /// How often pending bytes should be flushed to the terminal view.
     public let flushInterval: TimeInterval
 
-    /// Maximum number of pending bytes to retain before dropping the oldest bytes.
-    ///
-    /// This is a backpressure guard for workloads where the producer is faster than the UI.
-    /// It preserves the newest output, which is normally what live log viewers need most.
+    /// Maximum number of pending bytes retained before applying backpressure.
     public let maxPendingBytes: Int
+
+    /// Maximum number of bytes fed to the terminal in a single timer tick.
+    ///
+    /// This prevents one large backlog from monopolizing the main thread. The
+    /// default 64 KiB chunk size keeps parsing work bounded while still providing
+    /// high throughput for live log streams.
+    public let maxBytesPerFlush: Int
+
+    /// Backpressure strategy used when ``maxPendingBytes`` is exceeded.
+    public let backpressurePolicy: TerminalFeedBackpressurePolicy
+
+    /// Number of bytes currently waiting to be flushed.
+    public var pendingByteCount: Int {
+        lock.lock()
+        let count = pendingData.count
+        lock.unlock()
+        return count
+    }
+
+    /// Total number of bytes discarded by backpressure.
+    public var droppedByteCount: UInt64 {
+        lock.lock()
+        let count = droppedBytesStorage
+        lock.unlock()
+        return count
+    }
 
     /// Creates a coalescer for the given terminal view.
     ///
@@ -42,16 +88,22 @@ public final class TerminalFeedCoalescer {
     ///   - terminalView: The terminal view to feed. The coalescer keeps this weakly.
     ///   - flushInterval: Flush cadence. The default, 50 ms, caps feed work to about 20 Hz.
     ///   - maxPendingBytes: Backpressure cap for pending bytes. The default is 512 KiB.
+    ///   - maxBytesPerFlush: Maximum bytes to feed in one timer tick. The default is 64 KiB.
+    ///   - backpressurePolicy: Overflow policy. The default keeps the newest output.
     ///   - runLoopMode: Run-loop mode used by the flush timer. The default is `.default`.
     public init(
         terminalView: TerminalView,
         flushInterval: TimeInterval = 0.05,
         maxPendingBytes: Int = 512 * 1024,
+        maxBytesPerFlush: Int = 64 * 1024,
+        backpressurePolicy: TerminalFeedBackpressurePolicy = .keepNewest,
         runLoopMode: RunLoop.Mode = .default
     ) {
         self.terminalView = terminalView
         self.flushInterval = max(0.001, flushInterval)
         self.maxPendingBytes = max(1, maxPendingBytes)
+        self.maxBytesPerFlush = max(1, maxBytesPerFlush)
+        self.backpressurePolicy = backpressurePolicy
         self.runLoopMode = runLoopMode
 
         DispatchQueue.main.async { [weak self] in
@@ -78,7 +130,11 @@ public final class TerminalFeedCoalescer {
         append(contentsOf: text.utf8)
     }
 
-    /// Immediately flushes all pending bytes to the terminal view on the main queue.
+    /// Immediately flushes pending bytes to the terminal view on the main queue.
+    ///
+    /// At most ``maxBytesPerFlush`` bytes are fed per call. If more data remains,
+    /// subsequent timer ticks continue draining the buffer without blocking one
+    /// main-thread turn for the entire backlog.
     public func flush() {
         if !Thread.isMainThread {
             DispatchQueue.main.async { [weak self] in
@@ -87,17 +143,34 @@ public final class TerminalFeedCoalescer {
             return
         }
 
-        let bytes: [UInt8]
-        lock.lock()
-        if pendingBytes.isEmpty {
-            lock.unlock()
+        let bytes = nextFlushChunk()
+        guard !bytes.isEmpty else {
             return
         }
-        bytes = pendingBytes
-        pendingBytes.removeAll(keepingCapacity: true)
-        lock.unlock()
 
         terminalView?.feed(byteArray: bytes[...])
+    }
+
+    /// Flushes all pending bytes in bounded chunks.
+    ///
+    /// This is useful when a stream ends and the caller wants to drain the buffer.
+    /// It still yields one main-queue turn before each chunk when called off the
+    /// main thread, and each chunk is capped by ``maxBytesPerFlush``.
+    public func flushAll() {
+        if !Thread.isMainThread {
+            DispatchQueue.main.async { [weak self] in
+                self?.flushAll()
+            }
+            return
+        }
+
+        while true {
+            let bytes = nextFlushChunk()
+            guard !bytes.isEmpty else {
+                return
+            }
+            terminalView?.feed(byteArray: bytes[...])
+        }
     }
 
     /// Stops the timer and discards any pending bytes.
@@ -113,22 +186,67 @@ public final class TerminalFeedCoalescer {
         }
 
         lock.lock()
-        pendingBytes.removeAll(keepingCapacity: false)
+        pendingData.removeAll(keepingCapacity: false)
         lock.unlock()
     }
 
     private func append<S: Sequence>(contentsOf bytes: S) where S.Element == UInt8 {
         lock.lock()
-        pendingBytes.append(contentsOf: bytes)
-        trimPendingBytesIfNeeded()
+        switch backpressurePolicy {
+        case .keepNewest, .unbounded:
+            pendingData.append(contentsOf: bytes)
+            applyBackpressureIfNeeded()
+        case .keepOldest:
+            let freeCapacity = maxPendingBytes - pendingData.count
+            if freeCapacity <= 0 {
+                droppedBytesStorage += UInt64(bytes.underestimatedCount)
+            } else {
+                var appended = 0
+                for byte in bytes {
+                    if appended >= freeCapacity {
+                        droppedBytesStorage += 1
+                        continue
+                    }
+                    pendingData.append(byte)
+                    appended += 1
+                }
+            }
+        }
         lock.unlock()
     }
 
-    private func trimPendingBytesIfNeeded() {
-        guard pendingBytes.count > maxPendingBytes else {
+    private func nextFlushChunk() -> [UInt8] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard !pendingData.isEmpty else {
+            return []
+        }
+
+        let byteCount = min(maxBytesPerFlush, pendingData.count)
+        let chunk = Array(pendingData.prefix(byteCount))
+        pendingData.removeFirst(byteCount)
+        return chunk
+    }
+
+    private func applyBackpressureIfNeeded() {
+        guard backpressurePolicy != .unbounded,
+              pendingData.count > maxPendingBytes
+        else {
             return
         }
-        pendingBytes.removeFirst(pendingBytes.count - maxPendingBytes)
+
+        let overflow = pendingData.count - maxPendingBytes
+        switch backpressurePolicy {
+        case .keepNewest:
+            pendingData.removeFirst(overflow)
+            droppedBytesStorage += UInt64(overflow)
+        case .keepOldest:
+            pendingData.removeLast(overflow)
+            droppedBytesStorage += UInt64(overflow)
+        case .unbounded:
+            break
+        }
     }
 
     private func startTimer() {
@@ -151,12 +269,16 @@ public extension TerminalView {
     func makeFeedCoalescer(
         flushInterval: TimeInterval = 0.05,
         maxPendingBytes: Int = 512 * 1024,
+        maxBytesPerFlush: Int = 64 * 1024,
+        backpressurePolicy: TerminalFeedBackpressurePolicy = .keepNewest,
         runLoopMode: RunLoop.Mode = .default
     ) -> TerminalFeedCoalescer {
         TerminalFeedCoalescer(
             terminalView: self,
             flushInterval: flushInterval,
             maxPendingBytes: maxPendingBytes,
+            maxBytesPerFlush: maxBytesPerFlush,
+            backpressurePolicy: backpressurePolicy,
             runLoopMode: runLoopMode
         )
     }
